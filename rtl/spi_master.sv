@@ -38,7 +38,12 @@ module spi_master #(
   parameter int unsigned NUM_CS     = 4,
   parameter int unsigned FIFO_DEPTH = 16,
   parameter int unsigned DIV_WIDTH  = 16,
-  parameter int unsigned CS_DLY_W   = 8
+  parameter int unsigned CS_DLY_W   = 8,
+  parameter int unsigned CS_GAP_CYCLES = 0,
+  parameter int unsigned WORDS_PER_FRAME = 1,
+  // Optional receive sampling on the trailing edge for CPHA=0. The
+  // default retains the conventional leading-edge behavior for all users.
+  parameter bit RX_SAMPLE_TRAILING_EDGE = 1'b0
 ) (
   input  logic                          clk_i,
   input  logic                          rst_ni,
@@ -118,7 +123,8 @@ module spi_master #(
     S_CS_SETUP   = 3'd2,
     S_SHIFT      = 3'd3,
     S_CS_HOLD    = 3'd4,
-    S_DONE       = 3'd5
+    S_CS_GAP     = 3'd5,
+    S_DONE       = 3'd6
   } state_e;
 
   state_e state_q, state_d;
@@ -128,12 +134,17 @@ module spi_master #(
   logic [$clog2(NUM_CS)-1:0]  cs_sel_q;
   logic [CS_DLY_W-1:0]        setup_q, hold_q;
   logic                       inter_byte_q;
+  localparam int unsigned GAP_CNT_W = (CS_GAP_CYCLES < 2) ? 1 : $clog2(CS_GAP_CYCLES + 1);
+  localparam int unsigned FRAME_CNT_W = (WORDS_PER_FRAME < 2) ? 1 : $clog2(WORDS_PER_FRAME);
+  logic [GAP_CNT_W-1:0]       gap_cnt_q;
+  logic [FRAME_CNT_W-1:0]    frame_word_q;
 
   logic [DIV_WIDTH-1:0]       div_cnt_q;
   logic [$clog2(2*32+2)-1:0]  edge_cnt_q;     // 0..2*DATA_WIDTH
   logic [$clog2(33)-1:0]      sample_cnt_q;   // bits sampled so far
   logic [CS_DLY_W:0]          dly_cnt_q;
   logic                       sck_q;
+  logic                       mosi_q;
   logic [DATA_WIDTH-1:0]      tx_shift_q;
   logic [DATA_WIDTH-1:0]      rx_shift_q;
 
@@ -167,9 +178,16 @@ module spi_master #(
       end
       S_CS_HOLD: begin
         if (dly_cnt_q == '0) begin
-          if (inter_byte_q && !tx_fifo_empty) state_d = S_LOAD_WAIT;
+          if (inter_byte_q && !tx_fifo_empty &&
+              ((WORDS_PER_FRAME <= 1) ||
+               (frame_word_q < WORDS_PER_FRAME - 1))) state_d = S_LOAD_WAIT;
+          else if (CS_GAP_CYCLES != 0)         state_d = S_CS_GAP;
           else                                state_d = S_DONE;
         end
+      end
+      S_CS_GAP: begin
+        if (gap_cnt_q == '0)
+          state_d = S_DONE;
       end
       S_DONE: state_d = S_IDLE;
       default: state_d = S_IDLE;
@@ -196,7 +214,7 @@ module spi_master #(
     do_sample_w = 1'b0;
     if (state_q == S_SHIFT && div_cnt_q == '0) begin
       if (cpha_q == 1'b0) begin
-        if (!edge_cnt_q[0]) begin
+        if (edge_cnt_q[0] == RX_SAMPLE_TRAILING_EDGE) begin
           do_sample_w = 1'b1;
           rx_next_w   = lsb_q ? {miso_i, rx_shift_q[DATA_WIDTH-1:1]}
                               : {rx_shift_q[DATA_WIDTH-2:0], miso_i};
@@ -220,9 +238,7 @@ module spi_master #(
   end
 
   // mosi and sck.
-  assign mosi_o = (state_q == S_SHIFT)
-                    ? (lsb_q ? tx_shift_q[0] : tx_shift_q[DATA_WIDTH-1])
-                    : 1'b0;
+  assign mosi_o = mosi_q;
   assign sck_o  = sck_q;
 
   // -----------------------------------------------------------------
@@ -239,11 +255,14 @@ module spi_master #(
       setup_q         <= '0;
       hold_q          <= '0;
       inter_byte_q    <= 1'b0;
+      gap_cnt_q       <= '0;
+      frame_word_q    <= '0;
       div_cnt_q       <= '0;
       edge_cnt_q      <= '0;
       sample_cnt_q    <= '0;
       dly_cnt_q       <= '0;
       sck_q           <= 1'b0;
+      mosi_q          <= 1'b0;
       tx_shift_q      <= '0;
       rx_shift_q      <= '0;
       rx_fifo_wr_en_q <= 1'b0;
@@ -256,6 +275,25 @@ module spi_master #(
       xfer_done_o     <= (state_q == S_DONE);
       rx_fifo_wr_en_q <= 1'b0;
 
+      // Register MOSI in the system-clock domain. Load the first bit before
+      // the first leading SCK edge, then update the next bit on the same
+      // TX shift edge that advances tx_shift_q. This removes the
+      // state/data mux from the external output path while preserving the
+      // SPI mode timing at the pins.
+      if (state_q != S_SHIFT && state_d == S_SHIFT) begin
+        mosi_q <= lsb_q ? tx_shift_q[0] : tx_shift_q[DATA_WIDTH-1];
+      end else if (state_q == S_SHIFT && div_cnt_q == '0) begin
+        if ((cpha_q == 1'b0 && edge_cnt_q[0] &&
+             edge_cnt_q != edge_cnt_max - 1'b1) ||
+            (cpha_q == 1'b1 && !edge_cnt_q[0] && edge_cnt_q != '0)) begin
+          mosi_q <= lsb_q ? tx_shift_q[1] : tx_shift_q[DATA_WIDTH-2];
+        end else if (state_d != S_SHIFT) begin
+          mosi_q <= 1'b0;
+        end
+      end else if (state_d != S_SHIFT) begin
+        mosi_q <= 1'b0;
+      end
+
       // Latch configuration on transition out of IDLE into LOAD_WAIT.
       if (state_q == S_IDLE && state_d == S_LOAD_WAIT) begin
         cpol_q       <= cpol_i;
@@ -266,6 +304,7 @@ module spi_master #(
         setup_q      <= cs_setup_cycles_i;
         hold_q       <= cs_hold_cycles_i;
         inter_byte_q <= cs_inter_byte_i;
+        frame_word_q <= '0;
         sck_q        <= cpol_i;
         rx_shift_q   <= '0;
         edge_cnt_q   <= '0;
@@ -297,16 +336,20 @@ module spi_master #(
       // SCK divider + sample/shift logic.
       // We treat the data flow as a sequence of "bit slots". For each
       // bit slot:
-      //   * CPHA=0: SAMPLE on first SCK edge, SHIFT on second.
+      //   * CPHA=0: SHIFT on second SCK edge. By default MISO samples on
+      //     the first edge; the optional trailing-edge mode samples on
+      //     that second edge instead, before the slave's delayed update.
       //   * CPHA=1: SHIFT on first SCK edge (no actual change for bit 0
       //             since the loaded byte is already presented), SAMPLE
       //             on second.
       //
-      // edge_cnt_q runs 0..2*DATA_WIDTH-1. For mode 0/2 (CPHA=0), even
-      // edges (0, 2, 4, ...) sample MISO into rx_shift_q, odd edges
-      // shift tx_shift_q. For mode 1/3 (CPHA=1), even edges shift
+      // edge_cnt_q runs 0..2*DATA_WIDTH-1. For CPHA=0, even edges
+      // (0, 2, 4, ...) are leading/rising edges and odd edges are
+      // trailing/falling edges. TX shifts on odd edges in either RX
+      // mode. RX samples on even edges by default or odd edges when
+      // RX_SAMPLE_TRAILING_EDGE is enabled. For CPHA=1, even edges shift
       // (the very first one is a no-op because tx_shift_q is already
-      // showing bit 7), odd edges sample.
+      // showing bit 7), and odd edges sample.
       if (state_q == S_SHIFT) begin
         if (div_cnt_q == '0) begin
           div_cnt_q  <= div_q;
@@ -356,6 +399,16 @@ module spi_master #(
       if (state_q == S_SHIFT && state_d == S_CS_HOLD) begin
         edge_cnt_q <= '0;
       end
+
+      // CS is already high in S_CS_GAP. Keep it high for the configured
+      // number of clk_i cycles before completing this transaction.
+      if (state_q == S_CS_HOLD && state_d == S_CS_GAP)
+        gap_cnt_q <= GAP_CNT_W'(CS_GAP_CYCLES - 1);
+      else if (state_q == S_CS_GAP && gap_cnt_q != '0)
+        gap_cnt_q <= gap_cnt_q - 1'b1;
+
+      if (state_q == S_CS_HOLD && state_d == S_LOAD_WAIT)
+        frame_word_q <= frame_word_q + 1'b1;
     end
   end
 

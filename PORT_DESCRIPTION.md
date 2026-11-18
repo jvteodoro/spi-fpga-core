@@ -25,7 +25,9 @@ either wait for `xfer_done_o` or hold reset across a config change.
 | `cs_sel_i`          | log2(NUM_CS)| Which CS line drives low for this transfer.                              |
 | `cs_setup_cycles_i` | CS_DLY_W   | Cycles between CS-fall and the first SCK edge.                             |
 | `cs_hold_cycles_i`  | CS_DLY_W   | Cycles between the last shift edge and CS-rise (or the next byte).         |
-| `cs_inter_byte_i`   | 1          | 0 = de-assert CS between bytes, 1 = hold CS through the whole TX FIFO.    |
+| `cs_inter_byte_i`   | 1          | 0 = de-assert CS between words, 1 = hold CS through the configured frame.  |
+| `CS_GAP_CYCLES`     | parameter  | Number of `clk_i` cycles with CS high after a transaction when `cs_inter_byte_i=0`. |
+| `WORDS_PER_FRAME`   | parameter  | Maximum number of words sent while CS remains asserted in inter-word mode. |
 
 ## Master TX FIFO
 
@@ -40,7 +42,7 @@ Push interface is the standard sync-FIFO write port:
 | `tx_count_o`  | log2(DEPTH+1)   | Current occupancy.                                |
 
 Pop is internal — the master FSM consumes the head of the FIFO each
-time it loads a new shift register on a fresh byte.
+time it loads a new shift register on a fresh word.
 
 ## Master RX FIFO
 
